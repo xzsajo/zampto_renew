@@ -430,6 +430,10 @@ def start_server(page) -> bool:
     poll_interval = 10  # 每 10 秒刷新一次
     elapsed = 0
     final_status = "Unknown"
+    # Zampto 启动流程：Offline → Starting → Running
+    # 点击 Start 后有短暂窗口期页面仍显示 Offline，需连续多次才确认失败
+    offline_tolerance = 3   # 连续检测到 Offline 超过此次数才认定失败
+    offline_streak = 0
 
     while elapsed < wait_total:
         time.sleep(poll_interval)
@@ -443,17 +447,28 @@ def start_server(page) -> bool:
                 final_status = "Running"
                 log.info(f"✅ 服务器已变为 Running（等待了 {elapsed}s）")
                 take_screenshot(page, f"05_running_confirmed")
+                offline_streak = 0
                 break
             elif "Starting" in body:
                 final_status = "Starting"
+                offline_streak = 0
                 log.info(f"  [{elapsed}s] 还在 Starting，继续等待...")
                 take_screenshot(page, f"05_still_starting_{elapsed}s")
             elif "Offline" in body or "Stopped" in body:
+                offline_streak += 1
                 final_status = "Offline"
-                log.warning(f"  [{elapsed}s] 服务器回到 Offline，启动失败")
+                log.warning(
+                    f"  [{elapsed}s] 检测到 Offline（第 {offline_streak}/{offline_tolerance} 次）"
+                )
                 take_screenshot(page, f"05_start_failed_{elapsed}s")
-                break
+                if offline_streak >= offline_tolerance:
+                    log.warning(
+                        f"  连续 {offline_streak} 次 Offline，确认启动失败，退出等待"
+                    )
+                    break
+                log.info(f"  Offline 容忍中，继续等待（可能仍处于启动窗口期）...")
             else:
+                offline_streak = 0
                 log.info(f"  [{elapsed}s] 状态未知，继续等待...")
         except Exception as e:
             log.warning(f"  [{elapsed}s] 刷新页面异常: {e}")
@@ -487,31 +502,71 @@ def start_server(page) -> bool:
                     take_screenshot(page, "06_port_verified")
                     return True
                 else:
-                    log.warning(f"⚠️ 端口不可达，尝试 Restart 后再等一轮...")
-                    take_screenshot(page, "06_port_unreachable_before_restart")
+                    log.warning(f"⚠️ 端口不可达，改用 Stop → Start 彻底重启...")
+                    take_screenshot(page, "06_port_unreachable_before_stop_start")
 
-                    # ── 点击 Restart 按钮 ────────────────────────────────
+                    # ── 第一步：点击 Stop 按钮 ───────────────────────────
+                    stopped = False
+                    try:
+                        stop_btn = page.locator('button:has-text("Stop")').first
+                        if stop_btn.is_visible(timeout=5000):
+                            stop_btn.click()
+                            log.info("🛑 已点击 Stop 按钮")
+                            take_screenshot(page, "07_after_stop")
+                            # 等待面板变为 Offline/Stopped（最多 60s）
+                            log.info("⏳ 等待服务器停止（最多 60s）...")
+                            for _ in range(6):
+                                time.sleep(10)
+                                try:
+                                    page.reload(timeout=20000, wait_until="domcontentloaded")
+                                    time.sleep(3)
+                                    body_s = get_text(page)
+                                    if "Offline" in body_s or "Stopped" in body_s:
+                                        log.info("✅ 服务器已停止")
+                                        stopped = True
+                                        break
+                                    log.info("  还未停止，继续等待...")
+                                except Exception as e:
+                                    log.warning(f"  刷新异常: {e}")
+                            if not stopped:
+                                log.warning("⚠️ Stop 后未确认 Offline，仍继续尝试 Start")
+                                stopped = True  # 强行继续
+                        else:
+                            log.warning("Stop 按钮不可见，跳过 Stop 步骤")
+                    except Exception as e:
+                        log.warning(f"点击 Stop 失败: {e}")
+
+                    if not stopped:
+                        return False
+
+                    # ── 第二步：等几秒让端口完全释放 ─────────────────────
+                    log.info("⏸️ 等待 8 秒让端口完全释放...")
+                    time.sleep(8)
+
+                    # ── 第三步：点击 Start 按钮 ──────────────────────────
                     restarted = False
                     try:
-                        restart_btn = page.locator('button:has-text("Restart")').first
-                        if restart_btn.is_visible(timeout=5000):
-                            restart_btn.click()
-                            log.info("🔄 已点击 Restart 按钮")
+                        start_btn2 = page.locator('button:has-text("Start")').first
+                        if start_btn2.is_visible(timeout=10000):
+                            start_btn2.click()
+                            log.info("▶️ 已点击 Start 按钮（Stop→Start 流程）")
                             time.sleep(5)
-                            take_screenshot(page, "07_after_restart")
+                            take_screenshot(page, "08_after_stop_start")
                             restarted = True
                         else:
-                            log.warning("Restart 按钮不可见，跳过")
+                            log.warning("Start 按钮不可见，无法重新启动")
                     except Exception as e:
-                        log.warning(f"点击 Restart 失败: {e}")
+                        log.warning(f"点击 Start 失败: {e}")
 
                     if not restarted:
                         return False
 
-                    # ── 等待面板再次变为 Running ──────────────────────────
-                    log.info("⏳ Restart 后等待面板变为 Running（最多 5 分钟）...")
+                    # ── 第四步：等待面板变为 Running ──────────────────────
+                    log.info("⏳ Stop→Start 后等待面板变为 Running（最多 5 分钟）...")
                     elapsed2 = 0
                     running_again = False
+                    offline_streak2 = 0
+                    offline_tolerance2 = 3  # 同样的容忍机制
                     while elapsed2 < 300:
                         time.sleep(10)
                         elapsed2 += 10
@@ -520,33 +575,43 @@ def start_server(page) -> bool:
                             time.sleep(3)
                             body2 = get_text(page)
                             if "Running" in body2:
-                                log.info(f"✅ Restart 后面板已变为 Running（等待了 {elapsed2}s）")
-                                take_screenshot(page, f"08_restart_running")
+                                log.info(f"✅ Stop→Start 后面板已变为 Running（等待了 {elapsed2}s）")
+                                take_screenshot(page, "09_stop_start_running")
                                 running_again = True
+                                offline_streak2 = 0
                                 break
                             elif "Starting" in body2:
+                                offline_streak2 = 0
                                 log.info(f"  [{elapsed2}s] 还在 Starting，继续等待...")
                             elif "Offline" in body2 or "Stopped" in body2:
-                                log.warning(f"  [{elapsed2}s] Restart 后回到 Offline，放弃")
-                                break
+                                offline_streak2 += 1
+                                log.warning(
+                                    f"  [{elapsed2}s] 检测到 Offline（第 {offline_streak2}/{offline_tolerance2} 次）"
+                                )
+                                if offline_streak2 >= offline_tolerance2:
+                                    log.warning(
+                                        f"  连续 {offline_streak2} 次 Offline，确认 Stop→Start 启动失败，放弃"
+                                    )
+                                    break
+                                log.info(f"  Offline 容忍中，继续等待...")
                         except Exception as e:
                             log.warning(f"  [{elapsed2}s] 刷新异常: {e}")
 
                     if not running_again:
-                        log.warning("⚠️ Restart 后未能恢复 Running，放弃")
-                        take_screenshot(page, "08_restart_failed")
+                        log.warning("⚠️ Stop→Start 后未能恢复 Running，放弃")
+                        take_screenshot(page, "09_stop_start_failed")
                         return False
 
-                    # ── 再次验证端口 ──────────────────────────────────────
-                    log.info(f"🔌 Restart 后再次验证端口...")
+                    # ── 第五步：再次验证端口 ──────────────────────────────
+                    log.info(f"🔌 Stop→Start 后再次验证端口...")
                     port_ok2 = wait_for_port(host, port, max_wait=120, interval=10)
                     if port_ok2:
-                        log.info(f"✅ Restart 后端口验证通过")
-                        take_screenshot(page, "09_port_verified_after_restart")
+                        log.info(f"✅ Stop→Start 后端口验证通过")
+                        take_screenshot(page, "10_port_verified_after_stop_start")
                         return True
                     else:
-                        log.warning(f"⚠️ Restart 后端口仍不可达，请手动处理")
-                        take_screenshot(page, "09_port_still_unreachable")
+                        log.warning(f"⚠️ Stop→Start 后端口仍不可达，请手动处理")
+                        take_screenshot(page, "10_port_still_unreachable")
                         return False
             except ValueError:
                 pass
@@ -711,7 +776,7 @@ def main():
         if started:
             lines.append("  → 已启动，面板 Running + 端口可连接 ✅")
         elif "stopped" in status.lower() or "offline" in status.lower() or "failed" in status.lower():
-            lines.append("  ⚠️ 启动失败（含自动 Restart 重试），端口仍不可达，请手动处理")
+            lines.append("  ⚠️ 启动失败（已尝试 Stop→Start 彻底重启），端口仍不可达，请手动处理")
         lines.append("")
         lines.append(f"Expiry (Next Renewal): {new_expiry}")
         if last_renew:
