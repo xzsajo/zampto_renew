@@ -70,7 +70,7 @@ def redact_sensitive_info(page):
             // 重置正则 lastIndex
             emailRegex.lastIndex = 0;
             document.querySelectorAll('body *').forEach(el => {
-                // 只处理直接文本内容（避免重复处理子节点）
+                // 只处理直接文本 content（避免重复处理子节点）
                 el.childNodes.forEach(child => {
                     if (child.nodeType === Node.TEXT_NODE && emailRegex.test(child.textContent)) {
                         emailRegex.lastIndex = 0;
@@ -102,29 +102,6 @@ def get_text(page) -> str:
 
 def human_delay(min_s=0.5, max_s=1.2):
     time.sleep(random.uniform(min_s, max_s))
-
-def tcp_check(host: str, port: int, timeout: int = 5) -> bool:
-    """尝试 TCP 连接，返回是否成功。"""
-    import socket
-    try:
-        with socket.create_connection((host, port), timeout=timeout):
-            return True
-    except (socket.timeout, ConnectionRefusedError, OSError):
-        return False
-
-def wait_for_port(host: str, port: int, max_wait: int = 120, interval: int = 10) -> bool:
-    """轮询等待端口真正可连接，最多等 max_wait 秒。"""
-    log.info(f"🔌 等待端口可连接（最多 {max_wait}s）...")
-    elapsed = 0
-    while elapsed < max_wait:
-        if tcp_check(host, port):
-            log.info(f"✅ 端口已可连接（等待了 {elapsed}s）")
-            return True
-        time.sleep(interval)
-        elapsed += interval
-        log.info(f"  [{elapsed}s] 端口还未开放，继续等待...")
-    log.warning(f"⚠️ 端口等待超时（{max_wait}s）")
-    return False
 
 def wait_for_url_contains(page, keyword, timeout=15) -> bool:
     try:
@@ -419,7 +396,6 @@ def start_server(page) -> bool:
             take_screenshot(page, "04_after_start")
         else:
             log.warning("Start 按钮不可见（服务器可能已在运行）")
-            # 可能已经在 Running，继续等待确认
     except Exception as e:
         log.warning(f"点击 Start 失败: {e}")
         return False
@@ -430,8 +406,6 @@ def start_server(page) -> bool:
     poll_interval = 10  # 每 10 秒刷新一次
     elapsed = 0
     final_status = "Unknown"
-    # Zampto 启动流程：Offline → Starting → Running
-    # 点击 Start 后有短暂窗口期页面仍显示 Offline，需连续多次才确认失败
     offline_tolerance = 3   # 连续检测到 Offline 超过此次数才认定失败
     offline_streak = 0
 
@@ -447,7 +421,6 @@ def start_server(page) -> bool:
                 final_status = "Running"
                 log.info(f"✅ 服务器已变为 Running（等待了 {elapsed}s）")
                 take_screenshot(page, f"05_running_confirmed")
-                offline_streak = 0
                 break
             elif "Starting" in body:
                 final_status = "Starting"
@@ -476,149 +449,7 @@ def start_server(page) -> bool:
         log.warning(f"⚠️ 等待超时（{wait_total}s），最后状态: {final_status}")
         take_screenshot(page, "05_start_timeout")
 
-    if final_status != "Running":
-        return False
-
-    # ── 面板显示 Running，进一步用 TCP 验证端口真的开了 ─────────────────
-    addr_raw = None
-    try:
-        addr_raw = page.evaluate("""() => {
-            var body = document.body.innerText || '';
-            var m = body.match(/node\\d+\\.zampto\\.net:\\d+/i);
-            return m ? m[0] : null;
-        }""")
-    except Exception:
-        pass
-
-    if addr_raw:
-        parts = addr_raw.rsplit(":", 1)
-        if len(parts) == 2:
-            host, port_str = parts[0], parts[1]
-            try:
-                port = int(port_str)
-                port_ok = wait_for_port(host, port, max_wait=120, interval=10)
-                if port_ok:
-                    log.info(f"✅ TCP 端口验证通过，服务器真正可连接")
-                    take_screenshot(page, "06_port_verified")
-                    return True
-                else:
-                    log.warning(f"⚠️ 端口不可达，改用 Stop → Start 彻底重启...")
-                    take_screenshot(page, "06_port_unreachable_before_stop_start")
-
-                    # ── 第一步：点击 Stop 按钮 ───────────────────────────
-                    stopped = False
-                    try:
-                        stop_btn = page.locator('button:has-text("Stop")').first
-                        if stop_btn.is_visible(timeout=5000):
-                            stop_btn.click()
-                            log.info("🛑 已点击 Stop 按钮")
-                            take_screenshot(page, "07_after_stop")
-                            # 等待面板变为 Offline/Stopped（最多 60s）
-                            log.info("⏳ 等待服务器停止（最多 60s）...")
-                            for _ in range(6):
-                                time.sleep(10)
-                                try:
-                                    page.reload(timeout=20000, wait_until="domcontentloaded")
-                                    time.sleep(3)
-                                    body_s = get_text(page)
-                                    if "Offline" in body_s or "Stopped" in body_s:
-                                        log.info("✅ 服务器已停止")
-                                        stopped = True
-                                        break
-                                    log.info("  还未停止，继续等待...")
-                                except Exception as e:
-                                    log.warning(f"  刷新异常: {e}")
-                            if not stopped:
-                                log.warning("⚠️ Stop 后未确认 Offline，仍继续尝试 Start")
-                                stopped = True  # 强行继续
-                        else:
-                            log.warning("Stop 按钮不可见，跳过 Stop 步骤")
-                    except Exception as e:
-                        log.warning(f"点击 Stop 失败: {e}")
-
-                    if not stopped:
-                        return False
-
-                    # ── 第二步：等几秒让端口完全释放 ─────────────────────
-                    log.info("⏸️ 等待 8 秒让端口完全释放...")
-                    time.sleep(8)
-
-                    # ── 第三步：点击 Start 按钮 ──────────────────────────
-                    restarted = False
-                    try:
-                        start_btn2 = page.locator('button:has-text("Start")').first
-                        if start_btn2.is_visible(timeout=10000):
-                            start_btn2.click()
-                            log.info("▶️ 已点击 Start 按钮（Stop→Start 流程）")
-                            time.sleep(5)
-                            take_screenshot(page, "08_after_stop_start")
-                            restarted = True
-                        else:
-                            log.warning("Start 按钮不可见，无法重新启动")
-                    except Exception as e:
-                        log.warning(f"点击 Start 失败: {e}")
-
-                    if not restarted:
-                        return False
-
-                    # ── 第四步：等待面板变为 Running ──────────────────────
-                    log.info("⏳ Stop→Start 后等待面板变为 Running（最多 5 分钟）...")
-                    elapsed2 = 0
-                    running_again = False
-                    offline_streak2 = 0
-                    offline_tolerance2 = 3  # 同样的容忍机制
-                    while elapsed2 < 300:
-                        time.sleep(10)
-                        elapsed2 += 10
-                        try:
-                            page.reload(timeout=20000, wait_until="domcontentloaded")
-                            time.sleep(3)
-                            body2 = get_text(page)
-                            if "Running" in body2:
-                                log.info(f"✅ Stop→Start 后面板已变为 Running（等待了 {elapsed2}s）")
-                                take_screenshot(page, "09_stop_start_running")
-                                running_again = True
-                                offline_streak2 = 0
-                                break
-                            elif "Starting" in body2:
-                                offline_streak2 = 0
-                                log.info(f"  [{elapsed2}s] 还在 Starting，继续等待...")
-                            elif "Offline" in body2 or "Stopped" in body2:
-                                offline_streak2 += 1
-                                log.warning(
-                                    f"  [{elapsed2}s] 检测到 Offline（第 {offline_streak2}/{offline_tolerance2} 次）"
-                                )
-                                if offline_streak2 >= offline_tolerance2:
-                                    log.warning(
-                                        f"  连续 {offline_streak2} 次 Offline，确认 Stop→Start 启动失败，放弃"
-                                    )
-                                    break
-                                log.info(f"  Offline 容忍中，继续等待...")
-                        except Exception as e:
-                            log.warning(f"  [{elapsed2}s] 刷新异常: {e}")
-
-                    if not running_again:
-                        log.warning("⚠️ Stop→Start 后未能恢复 Running，放弃")
-                        take_screenshot(page, "09_stop_start_failed")
-                        return False
-
-                    # ── 第五步：再次验证端口 ──────────────────────────────
-                    log.info(f"🔌 Stop→Start 后再次验证端口...")
-                    port_ok2 = wait_for_port(host, port, max_wait=120, interval=10)
-                    if port_ok2:
-                        log.info(f"✅ Stop→Start 后端口验证通过")
-                        take_screenshot(page, "10_port_verified_after_stop_start")
-                        return True
-                    else:
-                        log.warning(f"⚠️ Stop→Start 后端口仍不可达，请手动处理")
-                        take_screenshot(page, "10_port_still_unreachable")
-                        return False
-            except ValueError:
-                pass
-    else:
-        log.warning("⚠️ 未能从页面读取服务器地址，跳过端口验证，以面板状态为准")
-
-    return True  # 读不到地址时降级为只看面板状态
+    return final_status == "Running"
 
 # ---------- 续期 ----------
 def renew_server(page, server_id: str, expiry_before: str) -> bool:
@@ -774,9 +605,9 @@ def main():
         status_icon = "🟢" if "running" in status.lower() else ("🟡" if "starting" in status.lower() else "🔴")
         lines.append(f"状态: {status_icon} {status}")
         if started:
-            lines.append("  → 已启动，面板 Running + 端口可连接 ✅")
+            lines.append("  → 已启动，面板已确认 Running ✅")
         elif "stopped" in status.lower() or "offline" in status.lower() or "failed" in status.lower():
-            lines.append("  ⚠️ 启动失败（已尝试 Stop→Start 彻底重启），端口仍不可达，请手动处理")
+            lines.append("  ⚠️ 启动失败，请手动处理")
         lines.append("")
         lines.append(f"Expiry (Next Renewal): {new_expiry}")
         if last_renew:
