@@ -20,6 +20,10 @@ on:
           - 'false'
           - 'true'
 
+permissions:
+  actions: write
+  contents: read
+
 jobs:
   zampto-auto:
     name: 检查状态 / 自动续期
