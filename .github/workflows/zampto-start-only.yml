@@ -18,6 +18,10 @@ on:
           - 'false'
           - 'true'
 
+permissions:
+  actions: write
+  contents: read
+
 jobs:
   restart:
     name: 紧急启动服务器
